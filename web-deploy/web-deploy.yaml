@@ -17,3 +17,8 @@ spec:
       containers:
       - image: nginx:1.28
         name: nginx
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          periodSeconds: 5
