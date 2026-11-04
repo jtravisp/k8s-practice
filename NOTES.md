@@ -2,37 +2,16 @@
 
 ## Pick up here
 
-**Next: OOMKilled drill.** Not started. `drills/oom.yaml` doesn't exist yet.
-
 1. `k3d cluster start drills` (if stopped), then `kubectl config current-context` should say `k3d-drills`
 2. Check: `curl.exe http://localhost:8082` returns the nginx page
-3. Create `drills/oom.yaml`:
-
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: oom
-spec:
-  containers:
-  - name: stress
-    image: polinux/stress
-    resources:
-      requests:
-        memory: "50Mi"
-      limits:
-        memory: "100Mi"
-    command: ["stress"]
-    args: ["--vm", "1", "--vm-bytes", "250M", "--vm-hang", "1"]
-```
-
-4. **Predict first:** What STATUS will it show, first and then after a minute or two? Will RESTARTS climb? Which component kills the process?
-5. `kubectl apply -f drills/oom.yaml`, then `kubectl get pod oom -w` (Ctrl+C after about a minute), then `kubectl describe pod oom`. Find Last State, Reason, and Exit Code.
-
-Why this drill matters: memory limits are the most common way model serving fails in production.
-Requests are what the scheduler reserves. Limits are a hard cap the kernel enforces through cgroups.
-
-Later drills: kill pods while curling in a loop (self-healing); k3s on one real VM (systemd, `journalctl -u k3s`, join token).
+3. Commit anything left over: the readiness probe in `web-deploy/web-deploy.yaml`, plus `drills/oom.yaml` (keep or delete)
+4. **Warm-up questions (unanswered from last session):**
+   - A pod is `Running` but `0/1` and isn't restarting. Readiness or liveness?
+   - A Service has empty Endpoints. What's the first command you run, and what are you looking for in its output?
+5. **Next drill (pick one):**
+   - **Liveness probes**: the restart version of the readiness drill. Same YAML shape, very different consequences.
+   - **Self-healing**: curl in a loop while deleting `web` pods. Watch the ReplicaSet replace them and the Service route around them.
+   - Later: k3s on one real VM (systemd, `journalctl -u k3s`, join token): the machine layer k3d skips.
 
 Interview prep to-do: check the Striveworks forks before mentioning them.
 `gh repo list striveworks --fork --limit 100`. Look for Triton, KServe, MLServer.
@@ -111,6 +90,7 @@ browser -> localhost:8082
 - KServe `InferenceService` -> KServe controller creates the serving stack (CRD + controller)
 
 ### Model serving (for the interview)
+- **Triton is to models what nginx is to web pages.** You give it trained model files, clients send inputs (images), and it returns predictions. It serves models but doesn't train them.
 - **Triton** (NVIDIA): the inference server process inside the pod. Serves ONNX/PyTorch/TensorRT/TF over HTTP/gRPC, batches requests, shares GPUs.
 - **KServe**: Kubernetes layer around it. You declare an `InferenceService`; its controller builds the Deployment, Service, routing, and autoscaling. Often runs Triton underneath.
 - **MLServer** (Seldon): a Python server doing Triton's job. All three use the Open Inference Protocol.
@@ -138,6 +118,45 @@ browser -> localhost:8082
 - Diagnose: `describe svc web` shows an empty `Endpoints:`, `get endpointslices -l kubernetes.io/service-name=web` shows `<unset>`, and `get pods --show-labels` shows the pods still have `app=web`.
 - Fix: reapply the file (`service/web configured`). The file in git is the source of truth, and reapplying it fixes drift. GitOps tools (Argo CD, Flux) automate this.
 - If a **pod's label** were changed instead, the ReplicaSet would stop counting that pod and create a replacement, leaving the old pod running unmanaged.
+
+### Stop / start persistence (2026-11-03)
+- After `k3d cluster stop` / `start`, everything was still there without reapplying. Single-server k3s keeps state in **SQLite** at `/var/lib/rancher/k3s/server/db/state.db` inside server-0, and stopping a container keeps its disk.
+- The API server only knows how to talk to etcd. k3s's **kine** layer translates the etcd protocol to SQL.
+- Pod objects survived (AGE 25h). Their containers restarted (`Restarts 1`).
+- `stop` keeps state; `delete` loses it. That's why the manifests are in git.
+- `k3d-drills-tools` stays stopped after `start`. It's a setup helper (`noop`), not a node.
+
+### Drill 2: OOMKilled (2026-11-03)
+- Predictions: OOM ✓, restarts ✓, containerd kills it ✗ (**the kernel** kills it).
+- How the limit is enforced: YAML limit → kubelet → containerd/runc writes cgroup `memory.max` → **Linux kernel OOM killer** sends SIGKILL → kubelet reports `OOMKilled`.
+- **Exit 137 = 128 + 9 (SIGKILL)**, killed hard. 143 = 128 + 15 (SIGTERM), a normal shutdown.
+- `CrashLoopBackOff` is a **waiting state** (10s, 20s, 40s, up to 5m), not a cause. The cause is in `describe` → Last State → Reason.
+- The kubelet restarts the container in place: same pod, same node, same IP.
+- `kubectl logs <pod> --previous` shows logs from the container that crashed.
+- No image tag means `:latest`, which is re-pulled on every restart. Pin tags (this matters on slow edge networks).
+- QoS: requests < limits → **Burstable**; requests = limits → **Guaranteed**; neither set → **BestEffort** (evicted first).
+- Fix: raise the limit (more memory) or lower `--vm-bytes` (like quantizing). Change one thing at a time when debugging.
+- Model serving: weights bigger than the limit → killed on load → 137 → CrashLoopBackOff, often with no useful logs.
+- Units: `Mi` = 1,048,576 bytes (binary), `M` = 1,000,000 (decimal). Use `Mi`/`Gi`. **`memory: 100m` = 0.1 bytes** (`m` means milli, correct only for CPU).
+
+### Drill 3: Bad readiness probe (2026-11-03)
+- **Running** = the process is alive. **Ready** = the pod can serve traffic. Without a probe, Kubernetes treats them as the same.
+- The kubelet runs the probe. HTTP 200–399 passes. Failing readiness → pod removed from the EndpointSlice → **no traffic, no restart**. (Failing liveness → restart.)
+- For a pod to get traffic, it needs **both** a selector match **and** Ready.
+- Added `readinessProbe: httpGet /healthz` → nginx returns 404 → pods stuck `0/1`, `Unhealthy (x14)`, `Restart Count: 0`.
+- Predicted 5 pods. Actual: **7** (4 old `1/1` + 3 new `0/1`). Changing the template doesn't wipe the Deployment; it **rolls**: a new ReplicaSet scales up as the old one scales down, and each step waits for readiness.
+  - maxSurge 25% of 5 → rounds **up** to 2 (max 7 pods). maxUnavailable 25% → rounds **down** to 1 (min 4 ready). So the rollout got stuck.
+  - `rollout status` hangs. After 10 min (`progressDeadlineSeconds`) it's marked failed. **No automatic rollback.**
+- curl still worked, because the 4 **old** pods served it. The new pods' nginx would have served `/` fine, but they weren't in the endpoint list. **A probe controls traffic based on what it checks, not on whether the app actually works.** A wrong probe can keep a healthy app out of service.
+- Fix: `path: /` in the file, then apply → a **third** ReplicaSet (new template = new hash). The old ReplicaSets stay at 0 as rollout history (`kubectl rollout history deployment/web`, keeps 10).
+- If the template exactly matched an old one, Kubernetes would scale that ReplicaSet back up. That's how `rollout undo` works.
+- Triton exposes `/v2/health/ready`, which returns 200 only after models load. Point the readiness probe there.
+
+### Diagnosing empty Endpoints
+| `get pods` READY | Cause | Clue |
+|---|---|---|
+| `1/1` | selector doesn't match | compare `describe svc` Selector vs `get pods --show-labels` |
+| `0/1` | readiness failing | `describe pod` Events: `Readiness probe failed` |
 
 ### What the response tells you (traefik)
 | Symptom | Meaning | Look at |
